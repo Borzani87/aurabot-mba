@@ -1,5 +1,5 @@
-streamlit
-google-genai
-chromadb
-pandas
-openpyxl
+streamlit>=1.40,<2
+google-genai>=1.0,<2
+pandas>=2.0,<3
+openpyxl>=3.1,<4
+python-dotenv>=1.0,<2
