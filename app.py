@@ -198,19 +198,24 @@ def chamar_gemini(api_key: str, prompt: str, modelo_preferido: str = "gemini-3.5
 
     ultimo_erro = None
     for modelo in modelos:
-        for tentativa in range(2):
+        for tentativa in range(3):
             try:
                 response = client.models.generate_content(
                     model=modelo,
                     contents=prompt,
                     config=types.GenerateContentConfig(temperature=0.1)
                 )
-                return response.text
+                return response.text or ""
             except Exception as e:
                 ultimo_erro = e
-                if "404" in str(e) or "NOT_FOUND" in str(e):
+                erro = str(e)
+                if "404" in erro or "NOT_FOUND" in erro:
                     break
-                time.sleep(2)
+                # 429 = limite de chamadas por minuto da camada gratuita: espera mais antes de tentar de novo
+                if "429" in erro or "RESOURCE_EXHAUSTED" in erro or "quota" in erro.lower():
+                    time.sleep(20)
+                else:
+                    time.sleep(3 * (tentativa + 1))
 
     raise RuntimeError(f"API temporariamente indisponível ({ultimo_erro}). Tente novamente em 5 segundos.")
 
@@ -299,6 +304,9 @@ def carregar_casos() -> list[dict]:
         return [json.loads(linha) for linha in f if linha.strip()]
 
 
+# Pausa entre chamadas para respeitar o limite por minuto da camada gratuita do Gemini
+PAUSA_ENTRE_CHAMADAS = 4
+
 RUBRICA_JUIZ = """Rubrica (nota de 1.0 a 5.0):
 - 5.0: correta e 100% fiel às políticas, cita a seção usada (ou encaminha para humano quando a informação não existe), tom cordial.
 - 4.0: correta, mas sem citação da seção ou com detalhe desnecessário.
@@ -328,6 +336,7 @@ with aba_eval:
             st.error("Insira sua Gemini API Key na barra lateral (ou defina GEMINI_API_KEY no .env).")
         else:
             resultados_eval = []
+            falhas_api = 0
             progresso = st.progress(0)
             status_texto = st.empty()
             versoes = ["v1 (Zero-Shot Simples)", "v2 (Role + XML + Restrições)", "v3 (Few-Shot + CoT + Citação)"]
@@ -346,8 +355,18 @@ with aba_eval:
 
                 linha = {"ID": cid, "Tipo": tipo, "Pergunta": caso["entrada"]}
                 for v in versoes:
-                    resp_bot = chamar_gemini(api_key, montar_prompt(v, ctx, perg), modelo_selecionado)
-                    resp_bot, _ = checar_saida(resp_bot)
+                    linha[f"Resposta {v.split()[0]}"] = ""
+                    try:
+                        resp_bot = chamar_gemini(api_key, montar_prompt(v, ctx, perg), modelo_selecionado)
+                        resp_bot, _ = checar_saida(resp_bot)
+                    except Exception as err:
+                        # Uma falha de API não derruba a avaliação inteira: o caso fica fora da média.
+                        falhas_api += 1
+                        linha[v] = float("nan")
+                        linha[f"Motivo {v.split()[0]}"] = f"[erro de API ao gerar resposta] {err}"[:300]
+                        time.sleep(PAUSA_ENTRE_CHAMADAS)
+                        continue
+                    time.sleep(PAUSA_ENTRE_CHAMADAS)
                     prompt_juiz = f"""Você é um auditor de qualidade de IA. Avalie a resposta do chatbot de pós-venda.
 {RUBRICA_JUIZ}
 
@@ -358,17 +377,21 @@ Gabarito Esperado: {gabarito}
 Resposta do Chatbot: {resp_bot}
 
 Responda APENAS um JSON válido: {{"nota": 4.5, "motivo": "explicacao curta"}}"""
-                    aval_raw = chamar_gemini(api_key, prompt_juiz, modelo_selecionado).replace("```json", "").replace("```", "").strip()
                     try:
-                        aval = json.loads(aval_raw)
-                        nota, motivo = float(aval["nota"]), str(aval.get("motivo", ""))
-                    except Exception:
-                        # Falha de parse do juiz não é falha do bot: fica fora da média (NaN), não vira 0.
-                        nota, motivo = float("nan"), f"[erro ao interpretar o juiz] {aval_raw[:200]}"
+                        aval_raw = chamar_gemini(api_key, prompt_juiz, modelo_selecionado).replace("```json", "").replace("```", "").strip()
+                        try:
+                            aval = json.loads(aval_raw)
+                            nota, motivo = float(aval["nota"]), str(aval.get("motivo", ""))
+                        except Exception:
+                            # Falha de parse do juiz não é falha do bot: fica fora da média (NaN), não vira 0.
+                            nota, motivo = float("nan"), f"[erro ao interpretar o juiz] {aval_raw[:200]}"
+                    except Exception as err:
+                        falhas_api += 1
+                        nota, motivo = float("nan"), f"[erro de API no juiz] {err}"[:300]
                     linha[v] = nota
                     linha[f"Resposta {v.split()[0]}"] = resp_bot
                     linha[f"Motivo {v.split()[0]}"] = motivo
-                    time.sleep(1.5)
+                    time.sleep(PAUSA_ENTRE_CHAMADAS)
                 resultados_eval.append(linha)
                 progresso.progress((idx + 1) / len(CASOS))
 
@@ -377,9 +400,11 @@ Responda APENAS um JSON válido: {{"nota": 4.5, "motivo": "explicacao curta"}}""
             st.success(f"✅ Avaliação dos {len(CASOS)} casos concluída!")
             st.dataframe(df_res[["ID", "Tipo", "Pergunta"] + versoes], use_container_width=True)
 
-            falhas_juiz = int(df_res[versoes].isna().sum().sum())
-            if falhas_juiz:
-                st.warning(f"{falhas_juiz} avaliação(ões) do juiz não puderam ser interpretadas e ficaram fora da média.")
+            sem_nota = int(df_res[versoes].isna().sum().sum())
+            if sem_nota:
+                st.warning(f"{sem_nota} de {len(CASOS) * len(versoes)} avaliações ficaram sem nota e fora da média "
+                           f"({falhas_api} por erro/limite da API; o restante por resposta do juiz ilegível). "
+                           "Veja a coluna 'Motivo' no Excel. Se forem muitas, espere alguns minutos e rode de novo.")
 
             st.subheader("Média Geral por Versão de Prompt")
             medias = df_res[versoes].mean()
